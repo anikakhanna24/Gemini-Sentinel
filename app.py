@@ -1,7 +1,18 @@
 import os
+import sys
 import json
+import subprocess
+from pathlib import Path
+
 import streamlit as st
 import pandas as pd
+
+BASE_DIR = Path(__file__).resolve().parent
+
+DEFAULT_EVENTS_FILE = BASE_DIR / "events.jsonl"
+RULES_FILE = BASE_DIR / "rules.yaml"
+INCIDENTS_FILE = BASE_DIR / "incidents.json"
+TEMP_INCIDENTS_FILE = BASE_DIR / "temp_incidents.json"
 
 from detect import (
     load_events,
@@ -126,18 +137,37 @@ div[data-testid="stMetric"] {
 # DATA HELPERS
 # ============================================================
 
-def load_incidents(events_file="events.jsonl", force_run=False):
-    output = "incidents.json" if events_file == "events.jsonl" else "temp_incidents.json"
+def load_incidents(events_file, force_run=False):
+    events_path = Path(events_file).resolve()
 
-    if force_run or not os.path.exists(output):
+    # Use a separate incidents file for uploaded event streams.
+    is_default_events = events_path == DEFAULT_EVENTS_FILE.resolve()
+
+    output_path = (
+        INCIDENTS_FILE
+        if is_default_events
+        else TEMP_INCIDENTS_FILE
+    )
+
+    if not events_path.is_file():
+        raise FileNotFoundError(
+            f"Events file does not exist: {events_path}"
+        )
+
+    if force_run or not output_path.is_file():
         with st.spinner("Running Sentinel detection pipeline..."):
             run_detection_pipeline(
-                rules_path="rules.yaml",
-                events_path=events_file,
-                output_path=output,
+                rules_path=str(RULES_FILE),
+                events_path=str(events_path),
+                output_path=str(output_path),
             )
 
-    with open(output, "r", encoding="utf-8") as f:
+    if not output_path.is_file():
+        raise FileNotFoundError(
+            f"Detection pipeline did not create: {output_path}"
+        )
+
+    with output_path.open("r", encoding="utf-8") as f:
         return json.load(f)
 
 
@@ -188,13 +218,59 @@ uploaded = st.sidebar.file_uploader(
     type=["jsonl"],
 )
 
-events_file = "events.jsonl"
-
 if uploaded is not None:
-    events_file = "temp_uploaded_events.jsonl"
-    with open(events_file, "wb") as f:
+    events_file = BASE_DIR / "temp_uploaded_events.jsonl"
+
+    with events_file.open("wb") as f:
         f.write(uploaded.getbuffer())
+
     st.sidebar.success("Custom event stream loaded.")
+
+else:
+    events_file = DEFAULT_EVENTS_FILE
+
+    # Generate synthetic events if they do not exist.
+    if not events_file.is_file():
+        with st.spinner("Generating synthetic security events..."):
+            try:
+                result = subprocess.run(
+                    [
+                        sys.executable,
+                        str(BASE_DIR / "generate_events.py"),
+                        "--out",
+                        str(events_file),
+                    ],
+                    cwd=str(BASE_DIR),
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                    check=False,
+                )
+
+                if result.returncode != 0:
+                    st.error("Failed to generate security events.")
+
+                    if result.stderr:
+                        st.code(result.stderr[-4000:])
+
+                    st.stop()
+
+                if not events_file.is_file():
+                    st.error(
+                        "Event generation completed, "
+                        "but events.jsonl was not created."
+                    )
+                    st.stop()
+
+                st.sidebar.success("Security events generated.")
+
+            except subprocess.TimeoutExpired:
+                st.error("Event generation timed out.")
+                st.stop()
+
+            except OSError as exc:
+                st.error(f"Could not run event generator: {exc}")
+                st.stop()
 
 if st.sidebar.button("Re-run Detection", use_container_width=True):
     load_incidents(events_file, force_run=True)
@@ -446,9 +522,15 @@ with right:
                         result = analyze_with_gemini(incident, build_incident_context(incident))
                         incident["llm_summary"] = result
                         incident["analysis_engine"] = "Gemini Sentinel"
-                        output = "incidents.json" if events_file == "events.jsonl" else "temp_incidents.json"
-                        with open(output, "w", encoding="utf-8") as f:
+                        output_path = (
+                            INCIDENTS_FILE
+                            if Path(events_file).resolve() == DEFAULT_EVENTS_FILE.resolve()
+                            else TEMP_INCIDENTS_FILE
+                        )
+
+                        with output_path.open("w", encoding="utf-8") as f:
                             json.dump(incidents, f, indent=2)
+                            
                         st.success("Gemini Sentinel analysis completed.")
                         st.rerun()
                     except Exception as exc:
